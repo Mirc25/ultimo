@@ -1,296 +1,169 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const path = require('path');
-const sanitizeHtml = require('sanitize-html');
-require('dotenv').config(); 
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
+
 const io = socketIo(server, {
-    cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
-    },
-    maxHttpBufferSize: 1e8 
+  cors: {
+    origin: "https://mirc25.com", // Permitir conexiones desde tu app React (el frontend)
+    methods: ["GET", "POST"]
+  },
+  // Mejorar la tolerancia a la red para móviles
+  pingTimeout: 30000, // Tiempo de espera antes de considerar desconectado (default 20s)
+  pingInterval: 5000 // Frecuencia de envío de pings (default 25s)
 });
 
-const PORT = process.env.PORT || 3000;
+// El puerto del backend. Render.com lo asignará a process.env.PORT, localmente será 8000.
+const PORT = process.env.PORT || 8000;
 
-app.use(express.json()); 
+app.use(cors());
+app.use(express.json());
 
-// --- ESTRUCTURAS DE DATOS EN MEMORIA (para chat anónimo y global) ---
-const onlineUsers = {}; 
-const provinceChatHistory = {}; 
-const privateChatHistory = {}; 
+// --- Gestión de usuarios online ---
+// connectedUsers: Map<socket.id, { id, nickname, sex, province }>
+const connectedUsers = new Map();
+// nicknameToSocketId: Map<nickname, socket.id> - para saber qué nickname está en uso y por quién
+const nicknameToSocketId = new Map();
 
-// --- CONFIGURACIÓN DE RATE LIMITING Y SILENCIAMIENTO (MUTE) ---
-const MESSAGE_LIMITS = new Map(); // Guarda { socketId: [{ timestamp1, timestamp2, ... }] }
-const MUTED_USERS = new Map();    // Guarda { socketId: unMuteTimestamp (Date.now() + duracion) }
-
-const MAX_MESSAGES_PER_PERIOD = 2; // Máximo de mensajes permitidos
-const PERIOD_SECONDS = 1; // En este período de tiempo
-const MUTE_DURATION_MS = 1 * 60 * 1000; // Duración del silenciamiento: ¡1 MINUTO AHORA!
-
-function checkRateLimit(socketId) {
-    const now = Date.now();
-
-    // 1. Verificar si el usuario está actualmente silenciado (muted)
-    if (MUTED_USERS.has(socketId)) {
-        const unMuteTime = MUTED_USERS.get(socketId);
-        if (now < unMuteTime) { // Si aún está silenciado
-            const remainingSeconds = Math.ceil((unMuteTime - now) / 1000);
-            const remainingMinutes = Math.ceil(remainingSeconds / 60);
-            console.warn(`🚫 [SERVER] Usuario ${socketId} silenciado. Tiempo restante: ${remainingSeconds}s.`);
-            io.to(socketId).emit('status message', `ESTÁS GENERANDO SPAM. Debes esperar ${remainingMinutes} ${remainingMinutes === 1 ? 'minuto' : 'minutos'} para volver a escribir.`);
-            return false; // Mensaje bloqueado
-        } else {
-            // Si el tiempo de silencio ha expirado, quitarlo de la lista de silenciados
-            MUTED_USERS.delete(socketId);
-            console.log(`✅ [SERVER] Usuario ${socketId} des-silenciado.`);
-        }
-    }
-
-    // 2. Aplicar el rate limit si no está silenciado o si ya expiró el silencio
-    let userTimestamps = MESSAGE_LIMITS.get(socketId) || [];
-
-    console.log(`🔍 [RATE LIMIT] Check para ${socketId}. Antes de filtrar: ${userTimestamps.length} mensajes.`);
-
-    const recentTimestamps = userTimestamps.filter(timestamp => (now - timestamp) < (PERIOD_SECONDS * 1000));
-    
-    console.log(`🔍 [RATE LIMIT] Para ${socketId}. Después de filtrar (últimos ${PERIOD_SECONDS}s): ${recentTimestamps.length} mensajes.`);
-    console.log(`🔍 [RATE LIMIT] Para ${socketId}. Límite: ${MAX_MESSAGES_PER_PERIOD} mensajes.`);
-
-    if (recentTimestamps.length >= MAX_MESSAGES_PER_PERIOD) {
-        // Si excede el límite de mensajes, silenciar al usuario
-        MUTED_USERS.set(socketId, now + MUTE_DURATION_MS);
-        console.warn(`⚠️ [SERVER] Rate limit EXCEDIDO para ${socketId}. SILENCIADO por ${MUTE_DURATION_MS / 1000} segundos.`);
-        io.to(socketId).emit('status message', `¡HAS EXCEDIDO EL LÍMITE DE MENSAJES! Has sido silenciado por ${MUTE_DURATION_MS / 1000 / 60} minuto.`); // Mensaje actualizado
-        return false; // Mensaje bloqueado y usuario silenciado
-    }
-
-    recentTimestamps.push(now);
-    MESSAGE_LIMITS.set(socketId, recentTimestamps.slice(-MAX_MESSAGES_PER_PERIOD));
-    
-    console.log(`✅ [RATE LIMIT] Mensaje PERMITIDO para ${socketId}. Mensajes en el período: ${recentTimestamps.length}`);
-    return true; // Mensaje permitido
-}
-
-// Función auxiliar para obtener el historial de chat privado
-function getPrivateChatId(user1, user2) {
-    return [user1, user2].sort().join('-');
-}
-
-// Middleware para servir archivos estáticos (frontend de React)
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Ruta principal para servir tu aplicación React
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-
-// --- LÓGICA DE SOCKET.IO ---
 io.on('connection', (socket) => {
-    console.log(`🟢 [SERVER] Nuevo cliente conectado: ${socket.id}`);
+  console.log(`Un usuario se ha conectado: ${socket.id}`);
 
-    // Limpiar el rate limit y el estado de silencio al conectar para evitar bloqueos persistentes si el servidor se reinicia
-    MESSAGE_LIMITS.delete(socket.id);
-    MUTED_USERS.delete(socket.id);
+  // 1. EL CLIENTE ENVIARÁ SU INFORMACIÓN EN ESTE EVENTO DESPUÉS DE CONECTARSE
+  socket.on('user_info', (data) => {
+    const { nickname, sex, province } = data;
 
-    socket.on('register', ({ nickname, gender, province }) => {
-        const sanitizedNickname = sanitizeHtml(nickname);
-        const sanitizedGender = sanitizeHtml(gender);
-        const sanitizedProvince = sanitizeHtml(province);
+    if (!nickname || !sex || !province) {
+      console.log(`⚠️ Info de usuario incompleta de ${socket.id}. Desconectando.`);
+      socket.emit('status message', 'Información de usuario incompleta. Por favor, reintenta.');
+      socket.disconnect(true); // Desconecta la nueva conexión si la info es inválida
+      return;
+    }
 
-        console.log(`➡️ [SERVER] Intento de registro: ${sanitizedNickname} (${sanitizedGender}, ${sanitizedProvince}) desde ${socket.id}`);
-
-        const existingUser = Object.values(onlineUsers).find(user => user.nickname.toLowerCase() === sanitizedNickname.toLowerCase());
-
-        if (existingUser) { 
-            console.log(`❌ [SERVER] Nickname '${sanitizedNickname}' ya en uso. Rechazando conexión para ${socket.id}`);
-            socket.emit('nickname in use', `El nickname "${sanitizedNickname}" ya está en uso. Por favor, elige otro.`);
-            socket.disconnect(true); 
+    // --- Validación de Nickname en Uso ---
+    if (nicknameToSocketId.has(nickname)) {
+        const existingSocketId = nicknameToSocketId.get(nickname);
+        if (existingSocketId !== socket.id) { // Nickname en uso por otra CONEXIÓN ACTIVA (otro socket.id)
+            console.log(`❌ Nickname "${nickname}" ya en uso por otro ID: ${existingSocketId}. Nuevo intento de ${socket.id}.`);
+            socket.emit('nickname in use', `El nickname "${nickname}" ya está en uso. Por favor, elige otro.`);
+            socket.disconnect(true); // Desconecta la nueva conexión
             return;
-        }
-
-        onlineUsers[socket.id] = { 
-            nickname: sanitizedNickname, 
-            gender: sanitizedGender, 
-            province: sanitizedProvince, 
-            socketId: socket.id,
-            lastSeen: new Date()
-        };
-        socket.join(sanitizedProvince); 
-
-        console.log(`✅ [SERVER] Usuario registrado: ${onlineUsers[socket.id].nickname} (${onlineUsers[socket.id].gender}, ${onlineUsers[socket.id].province}) - Socket ID: ${socket.id}`);
-        socket.emit('info accepted'); 
-
-        io.emit('user list', Object.values(onlineUsers).map(u => ({
-            nickname: u.nickname,
-            gender: u.gender,
-            province: u.province,
-            socketId: u.socketId
-        })));
-
-        if (provinceChatHistory[onlineUsers[socket.id].province]) {
-            socket.emit('province history', { 
-                room: onlineUsers[socket.id].province, 
-                history: provinceChatHistory[onlineUsers[socket.id].province] 
-            });
-        }
-    });
-
-    const getSenderData = (socketId) => {
-        const user = onlineUsers[socketId];
-        return {
-            sender: user ? user.nickname : 'Desconocido',
-            senderGender: user ? user.gender : 'other'
-        };
-    };
-
-    socket.on('chat message', (data) => {
-        if (!checkRateLimit(socket.id)) { 
-            return; 
-        }
-        const { sender, senderGender } = getSenderData(socket.id); 
-        const userProvince = onlineUsers[socket.id] ? onlineUsers[socket.id].province : 'unknown';
-
-        const sanitizedText = sanitizeHtml(data.text);
-        const message = {
-            sender: sender,
-            senderGender: senderGender, 
-            text: sanitizedText,
-            timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-            room: userProvince, 
-            type: 'text'
-        };
-
-        if (!provinceChatHistory[userProvince]) {
-            provinceChatHistory[userProvince] = [];
-        }
-        provinceChatHistory[userProvince].push(message);
-
-        io.to(userProvince).emit('chat message', message);
-        console.log(`💬 [SERVER] Mensaje de sala '${userProvince}' de ${sender}: ${sanitizedText}`);
-    });
-
-    socket.on('image message', (data) => {
-        if (!checkRateLimit(socket.id)) { 
-            return; 
-        }
-        const { sender, senderGender } = getSenderData(socket.id); 
-        const userProvince = onlineUsers[socket.id] ? onlineUsers[socket.id].province : 'unknown';
-
-        const message = {
-            sender: sender,
-            senderGender: senderGender,
-            file: data.file, 
-            timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-            room: userProvince,
-            type: 'image'
-        };
-
-        if (!provinceChatHistory[userProvince]) {
-            provinceChatHistory[userProvince] = [];
-        }
-        provinceChatHistory[userProvince].push(message);
-
-        io.to(userProvince).emit('chat message', message); 
-        console.log(`🖼️ [SERVER] Imagen de sala '${userProvince}' de ${sender} (${data.file.substring(0, 30)}...)`);
-    });
-
-    socket.on('private message', async ({ to, text }) => {
-        if (!checkRateLimit(socket.id)) { 
-            return; 
-        }
-        const senderData = getSenderData(socket.id); 
-        const recipientUser = Object.values(onlineUsers).find(u => u.nickname === to);
-
-        if (!senderData.sender || !recipientUser) {
-            console.warn(`⚠️ [SERVER] Mensaje privado: remitente (${socket.id}) o destinatario (${to}) no encontrado.`);
-            return;
-        }
-
-        const sanitizedText = sanitizeHtml(text);
-        const message = {
-            sender: senderData.sender,
-            senderGender: senderData.senderGender, 
-            text: sanitizedText,
-            timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-            to: recipientUser.nickname, 
-            type: 'text'
-        };
-
-        const privateChatId = getPrivateChatId(senderData.sender, recipientUser.nickname);
-        if (!privateChatHistory[privateChatId]) {
-            privateChatHistory[privateChatId] = [];
-        }
-        privateChatHistory[privateChatId].push(message);
-
-        io.to(recipientUser.socketId).emit('private message', message);
-        io.to(socket.id).emit('private message', message); 
-        console.log(`🔒 [SERVER] Mensaje privado de ${senderData.sender} a ${recipientUser.nickname}: ${sanitizedText}`);
-    });
-
-    socket.on('private image message', async ({ to, file }) => {
-        if (!checkRateLimit(socket.id)) { 
-            return; 
-        }
-        const senderData = getSenderData(socket.id); 
-        const recipientUser = Object.values(onlineUsers).find(u => u.nickname === to);
-
-        if (!senderData.sender || !recipientUser) {
-            console.warn(`⚠️ [SERVER] Imagen privada: remitente (${socket.id}) o destinatario (${to}) no encontrado.`);
-            return;
-        }
-
-        const message = {
-            sender: senderData.sender,
-            senderGender: senderData.senderGender,
-            file: file, 
-            timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-            to: recipientUser.nickname,
-            type: 'image'
-        };
-
-        const privateChatId = getPrivateChatId(senderData.sender, recipientUser.nickname);
-        if (!privateChatHistory[privateChatId]) {
-            privateChatHistory[privateChatId] = [];
-        }
-        privateChatHistory[privateChatId].push(message);
-
-        io.to(recipientUser.socketId).emit('private message', message); 
-        io.to(socket.id).emit('private message', message); 
-        console.log(`🖼️🔒 [SERVER] Imagen privada de ${senderData.sender} a ${recipientUser.nickname} (${file.substring(0, 30)}...)`);
-    });
-
-    socket.on('disconnect', (reason) => {
-        const disconnectedUser = onlineUsers[socket.id];
-        if (disconnectedUser) {
-            delete onlineUsers[socket.id];
-            socket.leave(disconnectedUser.province); 
-            console.log(`🔴 [SERVER] Usuario ${disconnectedUser.nickname} (${disconnectedUser.gender}) se ha desconectado. Razón: ${reason}`);
-
-            io.emit('user list', Object.values(onlineUsers).map(u => ({
-                nickname: u.nickname,
-                gender: u.gender,
-                province: u.province,
-                socketId: u.socketId
-            })));
         } else {
-            console.log(`🔴 [SERVER] Cliente no registrado (${socket.id}) se ha desconectado. Razón: ${reason}`);
+            // Es el mismo usuario reconectando con el mismo nickname y socket.id.
+            // Esto puede pasar en algunas reconexiones donde el socket.id no cambia inmediatamente
+            // o el cliente reenvía la info. Actualizamos el estado si es necesario.
+            console.log(`🔄 Nickname "${nickname}" ya registrado para este socket ${socket.id}. Actualizando info.`);
+            const currentUser = connectedUsers.get(socket.id);
+            if (currentUser && (currentUser.sex !== sex || currentUser.province !== province)) {
+                connectedUsers.set(socket.id, { id: socket.id, nickname, sex, province });
+            }
+            // No necesitamos re-emitir la lista ni la info accepted, ya que el estado ya está consistente
+            return;
         }
-        MESSAGE_LIMITS.delete(socket.id); 
-        MUTED_USERS.delete(socket.id); 
-    });
+    }
 
-    socket.on('connect_error', (err) => {
-        console.error(`❌ [SERVER] Error de conexión para ${socket.id}: ${err.message}`);
-    });
+    // Si el nickname no estaba en uso o es una nueva conexión con un nickname único
+    const user = { id: socket.id, nickname, sex, province };
+    connectedUsers.set(socket.id, user);
+    nicknameToSocketId.set(nickname, socket.id); // Registra el nickname y su socket.id actual
+
+    console.log(`✅ Usuario ${nickname} (${socket.id}) conectado a la sala: ${province}`);
+    socket.join(province); // Une al usuario a la sala de su provincia
+
+    // Emitir la lista actualizada de usuarios a todos los clientes
+    io.emit('user list', Array.from(connectedUsers.values()));
+    socket.emit('info accepted', province); // Confirma al cliente que su info fue aceptada
+
+    // Emitir mensaje de estado a la sala provincial (solo para la sala)
+    io.to(province).emit('status message', `${nickname} se ha unido al canal.`);
+  });
+
+
+  // --- Eventos de Mensajes ---
+  socket.on('chat message', (msg) => {
+    const user = connectedUsers.get(socket.id);
+    if (!user) {
+        console.log(`⚠️ Mensaje de socket sin info de usuario (no registrado): ${socket.id}`);
+        // Considerar enviar un mensaje de error al cliente o desconectarlo
+        return;
+    }
+    const messageToSend = {
+        sender: user.nickname,
+        text: msg.text,
+        timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+        room: user.province // Aseguramos que el mensaje va a la sala del usuario
+    };
+    console.log(`💬 Mensaje recibido de ${user.nickname} en ${user.province}: ${msg.text}`);
+    io.to(user.province).emit('chat message', messageToSend);
+  });
+
+  socket.on('private message', (data) => {
+    const user = connectedUsers.get(socket.id);
+    if (!user) {
+        console.log(`⚠️ Mensaje privado de socket sin info de usuario (no registrado): ${socket.id}`);
+        return;
+    }
+    const { to, msg } = data;
+    const recipientSocketId = nicknameToSocketId.get(to); // Busca el socket.id del destinatario por su nickname
+
+    if (recipientSocketId) {
+        const privateMessage = {
+            from: user.nickname,
+            to: to,
+            text: msg.text,
+            timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+        };
+        console.log(`🔒 Mensaje privado de ${user.nickname} para ${to}`);
+        // Enviar al destinatario
+        io.to(recipientSocketId).emit('private message', privateMessage);
+        // También enviar al remitente para que lo vea en su propia conversación
+        io.to(socket.id).emit('private message', privateMessage);
+    } else {
+        console.log(`❌ Destinatario privado "${to}" no encontrado.`);
+        socket.emit('status message', `El usuario "${to}" no está online o no fue encontrado.`);
+    }
+  });
+
+  // --- Manejo de Desconexión ---
+  socket.on('disconnect', (reason) => {
+    console.log(`Un usuario se ha desconectado: ${socket.id}. Razón: ${reason}`);
+    const user = connectedUsers.get(socket.id); // Obtiene la info del usuario desconectado
+
+    if (user) {
+        connectedUsers.delete(socket.id); // Elimina el socket.id del mapa de usuarios conectados
+
+        // Comprueba si el nickname de este usuario todavía está asociado a otro socket.id
+        // Si no hay ningún otro socket.id usando este nickname, lo eliminamos de nicknameToSocketId.
+        let isNicknameStillInUseByAnotherSocket = false;
+        for (let [sId, u] of connectedUsers) {
+            if (u.nickname === user.nickname && sId !== socket.id) {
+                isNicknameStillInUseByAnotherSocket = true;
+                break;
+            }
+        }
+        if (!isNicknameStillInUseByAnotherSocket) {
+            nicknameToSocketId.delete(user.nickname); // Libera el nickname
+            console.log(`✅ Nickname "${user.nickname}" liberado.`);
+        }
+
+        // Si el usuario estaba en una sala provincial, el socket.io-client lo manejará automáticamente
+        // al salir de la sala. Aquí solo actualizamos la lista de usuarios.
+        io.emit('user list', Array.from(connectedUsers.values()));
+        io.emit('status message', `${user.nickname} se ha desconectado.`);
+        console.log(`🟢 ${user.nickname} (${socket.id}) desconectado. Usuarios online: ${connectedUsers.size}`);
+    } else {
+        console.log(`🔴 Socket ${socket.id} desconectado, pero no se encontró información de usuario registrada.`);
+    }
+  });
+});
+
+// Ruta de prueba para el servidor
+app.get('/', (req, res) => {
+  res.send('Servidor de chat funcionando con Express y Socket.IO');
 });
 
 server.listen(PORT, () => {
-    console.log(`✅ [SERVER] Servidor de chat escuchando en http://localhost:${PORT}`);
-    console.log(`✅ [SERVER] La aplicación React se servirá desde el directorio 'public'`);
+  console.log(`SERVER: Servidor de chat escuchando en el puerto ${PORT}`);
 });
